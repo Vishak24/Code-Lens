@@ -1,0 +1,10 @@
+.venv/
+.env
+.chromadb/
+query_log.json
+__pycache__/
+*.pyc
+graphify-out/
+.DS_Store
+.claude/
+.vscode/

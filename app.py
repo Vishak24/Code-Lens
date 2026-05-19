@@ -1,4 +1,6 @@
+import os
 import re
+import shutil
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -15,10 +17,18 @@ from codelens.embedder import embed_chunks, init_chromadb, load_model, store_chu
 from codelens.evaluator import QueryLogger, answer_relevance_score, log_query
 from codelens.graph_builder import build_graph
 from codelens.ingestion import accept_input, walk_files
-from codelens.llm import ask, generate_followups
+from codelens.llm import ask
 from codelens.retriever import HybridRetriever
 
 load_dotenv()
+
+# Inject GROQ_API_KEY from Streamlit secrets if available (Streamlit Cloud deployment)
+try:
+    _sk = st.secrets.get("GROQ_API_KEY", "")
+    if _sk:
+        os.environ["GROQ_API_KEY"] = _sk
+except Exception:
+    pass
 
 st.set_page_config(
     page_title="CodeLens",
@@ -216,25 +226,6 @@ section[data-testid="stSidebar"] { display: none !important; }
   background: var(--surface-3) !important;
   color: var(--text-faint) !important;
   cursor: not-allowed !important;
-}
-
-/* Pill-style secondary button (follow-ups) */
-.stButton > button[kind="secondary"] {
-  background: rgba(45,212,191,0.08) !important;
-  border: 1px solid rgba(45,212,191,0.25) !important;
-  color: #7d8590 !important;
-  font-family: 'Inter', sans-serif !important;
-  font-weight: 400 !important;
-  font-size: 13px !important;
-  border-radius: 99px !important;
-  height: auto !important;
-  padding: 8px 16px !important;
-  transition: all 150ms ease !important;
-}
-.stButton > button[kind="secondary"]:hover {
-  background: rgba(45,212,191,0.15) !important;
-  border-color: #2dd4bf !important;
-  color: #e6edf3 !important;
 }
 
 /* ── TEXT INPUT ──────────────────────────────────────────────────────────── */
@@ -905,6 +896,71 @@ def _render_query_history(entries: list) -> None:
     )
 
 
+# ─── API KEY GUARD ───────────────────────────────────────────────────────────
+if not os.environ.get("GROQ_API_KEY"):
+    st.error(
+        "GROQ_API_KEY is not set. Add it to your environment variables "
+        "or Streamlit secrets."
+    )
+    st.stop()
+
+# ─── INPUT VALIDATION ────────────────────────────────────────────────────────
+MAX_QUERIES_PER_MINUTE  = 10
+MAX_INGESTIONS_PER_HOUR = 5
+_REPO_SIZE_LIMIT_MB     = 500
+
+_GITHUB_URL_RE = re.compile(r'^https://github\.com/[\w\-\.]+/[\w\-\.]+/?$')
+_INJECTION_PHRASES = [
+    "ignore previous instructions",
+    "ignore all instructions",
+    "disregard your",
+    "you are now",
+    "act as",
+    "jailbreak",
+    "system prompt",
+]
+_DANGEROUS_PATTERNS = ["<script", "javascript:", "file://", "../", "..\\", "%2e%2e"]
+
+
+def validate_github_url(url: str) -> tuple[bool, str]:
+    url = url.strip()
+    if not url:
+        return False, "Please enter a GitHub URL."
+    if not _GITHUB_URL_RE.match(url):
+        return False, "Invalid URL format. Expected: https://github.com/owner/repository"
+    for d in _DANGEROUS_PATTERNS:
+        if d.lower() in url.lower():
+            return False, "Invalid URL."
+    return True, ""
+
+
+def validate_query(query: str) -> tuple[bool, str]:
+    query = query.strip()
+    if not query:
+        return False, "Please enter a question."
+    if len(query) < 5:
+        return False, "Query is too short. Please be more specific."
+    if len(query) > 1000:
+        return False, f"Query is too long ({len(query)} characters). Please keep it under 1000 characters."
+    q_lower = query.lower()
+    for phrase in _INJECTION_PHRASES:
+        if phrase in q_lower:
+            return False, "Query contains disallowed content. Please ask a question about the codebase."
+    return True, ""
+
+
+def _get_dir_size_mb(path: str) -> float:
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total / (1024 * 1024)
+
+
 # ─── SESSION STATE ────────────────────────────────────────────────────────────
 _DEFAULTS: dict = {
     "repo_path":           None,
@@ -916,11 +972,11 @@ _DEFAULTS: dict = {
     "stats":               None,
     "ingest_time_s":       None,
     "query_log":           [],
-    "query_input_staged":  "",
-    "followups":           [],
     "last_results":        [],
     "last_answer":         "",
     "active_tab":          0,
+    "query_timestamps":    [],
+    "ingest_timestamps":   [],
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -959,32 +1015,56 @@ with tab1:
         st.session_state.repo_path     = None
         st.session_state.last_results  = []
         st.session_state.last_answer   = ""
-        st.session_state.followups     = []
         st.session_state.ingest_time_s = None
+
+        # ── Ingestion rate limit ───────────────────────────────────────────────
+        _now = time.time()
+        st.session_state.ingest_timestamps = [
+            t for t in st.session_state.ingest_timestamps if _now - t < 3600
+        ]
+        if len(st.session_state.ingest_timestamps) >= MAX_INGESTIONS_PER_HOUR:
+            st.error(
+                "Ingestion limit reached. You can analyze up to 5 "
+                "repositories per hour. Please wait before re-indexing."
+            )
+            st.stop()
+        st.session_state.ingest_timestamps.append(_now)
 
         _url = url_input.strip()
         _is_github = "github.com" in _url
         _valid = True
 
-        if _is_github and not re.match(
-            r"https?://github\.com/[^/\s]+/[^/\s]+", _url
-        ):
-            st.error(
-                "Please enter a valid GitHub URL (e.g. https://github.com/owner/repo)"
-            )
-            _valid = False
+        if _is_github:
+            _ok, _msg = validate_github_url(_url)
+            if not _ok:
+                st.error(_msg)
+                _valid = False
 
         if _valid:
             _t0 = time.perf_counter()
             _placeholder = st.empty()
             _completed: set = set()
             _details: dict[str, str] = {}
+            _clone_path: str | None = None
 
             try:
                 _render_step_list(_placeholder, "clone", _completed, _details)
                 local_path, repo_name = accept_input(_url)
+                if _is_github:
+                    _clone_path = local_path
                 _completed.add("clone")
                 _details["clone"] = repo_name
+
+                # ── Repo size guard ───────────────────────────────────────────
+                if _is_github:
+                    _repo_mb = _get_dir_size_mb(local_path)
+                    if _repo_mb > _REPO_SIZE_LIMIT_MB:
+                        shutil.rmtree(local_path, ignore_errors=True)
+                        st.error(
+                            f"Repository is too large ({_repo_mb:.0f} MB). "
+                            f"CodeLens supports repositories up to {_REPO_SIZE_LIMIT_MB} MB."
+                        )
+                        st.stop()
 
                 _render_step_list(_placeholder, "detect", _completed, _details)
                 file_list, stats = walk_files(local_path)
@@ -1013,6 +1093,9 @@ with tab1:
                 _completed.add("done")
                 _details["done"] = f"{stats.total_files} files · {len(chunks)} chunks"
                 _render_step_list(_placeholder, "done", _completed, _details)
+
+                if _clone_path:
+                    shutil.rmtree(_clone_path, ignore_errors=True)
 
                 st.session_state.repo_path     = local_path
                 st.session_state.repo_name     = repo_name
@@ -1140,8 +1223,7 @@ with tab2:
     query = st.text_input(
         "Ask About the Codebase",
         placeholder="e.g. How does authentication work in this repo?",
-        key="query_input_widget",
-        value=st.session_state.get("query_input_staged", ""),
+        key="query_input",
     )
 
     _available_langs = (
@@ -1170,6 +1252,25 @@ with tab2:
         )
 
     if submit and _can_query:
+        # ── Query rate limit ───────────────────────────────────────────────────
+        _now = time.time()
+        st.session_state.query_timestamps = [
+            t for t in st.session_state.query_timestamps if _now - t < 60
+        ]
+        if len(st.session_state.query_timestamps) >= MAX_QUERIES_PER_MINUTE:
+            st.error(
+                "Rate limit reached. You can run up to 10 queries "
+                "per minute. Please wait a moment and try again."
+            )
+            st.stop()
+        st.session_state.query_timestamps.append(_now)
+
+        # ── Query validation ───────────────────────────────────────────────────
+        _q_ok, _q_msg = validate_query(query)
+        if not _q_ok:
+            st.error(_q_msg)
+            st.stop()
+
         try:
             _model     = load_model()
             _retriever = HybridRetriever(
@@ -1188,20 +1289,15 @@ with tab2:
             with st.spinner("Generating answer..."):
                 _resp = ask(query, _context)
 
-            with st.spinner("Generating follow-up questions..."):
-                _followups = generate_followups(query, _resp["answer"])
-
             _latency_ms = (time.perf_counter() - t0) * 1000
             _relevance  = answer_relevance_score(query, _resp["answer"])
 
             st.session_state.last_results = _results
             st.session_state.last_answer  = _resp["answer"]
-            st.session_state.followups    = _followups
 
             _entry = log_query(query, _resp["answer"], _results, _latency_ms, _relevance)
             _entry["repository"] = st.session_state.repo_name or ""
             _logger.log(_entry)
-            st.session_state.query_input_staged = ""
 
         except Exception as exc:
             _exc_str = str(exc).lower()
@@ -1229,7 +1325,7 @@ with tab2:
                 '</div>',
                 unsafe_allow_html=True,
             )
-            for _i, _r in enumerate(st.session_state.last_results):
+            for _r in st.session_state.last_results:
                 _score = _r["score"]
                 _pct   = min(100.0, _score * 100)
                 _lang  = _r.get("language", "text")
@@ -1255,23 +1351,6 @@ with tab2:
                 with st.expander(f"View Code  ·  {_src}  ·  L{_start}–{_end}", expanded=False):
                     st.code(_r["text"], language=_lang)
 
-        # ── Follow-ups (horizontal pills) ─────────────────────────────────────
-        if st.session_state.followups:
-            st.markdown(
-                '<div class="section-header" style="margin-top:24px">'
-                '<span class="section-title">Suggested Follow-Ups</span>'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            _fu_cols = st.columns(len(st.session_state.followups))
-            for _i, (_col, _fq) in enumerate(
-                zip(_fu_cols, st.session_state.followups)
-            ):
-                with _col:
-                    if st.button(_fq, key=f"fu_{_i}", type="secondary", width="stretch"):
-                        st.session_state["query_input_staged"] = _fq
-                        st.session_state["active_tab"] = 1
-                        st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Metrics

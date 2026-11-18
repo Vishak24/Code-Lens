@@ -37,7 +37,7 @@ Question ─► HybridRetriever
 
 - GitHub URL validation and query validation before any work is done.
 - Per-session rate limits: 5 repository ingestions per hour, 10 queries per minute.
-- The API key is read from the environment (`.env` is git-ignored), never from the UI.
+- The API key is read from the environment or Streamlit secrets (`.env` is git-ignored), never entered in the UI.
 
 ## Run it locally
 
